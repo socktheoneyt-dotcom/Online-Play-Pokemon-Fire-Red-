@@ -1,0 +1,1682 @@
+diff --git a/bridge/PROTOCOL.md b/bridge/PROTOCOL.md
+new file mode 100644
+index 0000000..864f924
+--- /dev/null
++++ b/bridge/PROTOCOL.md
+@@ -0,0 +1,43 @@
++# PSS mailbox protocol (version 1)
++
++The ROM never touches a network. It keeps a 0xA0-byte mailbox in EWRAM
++(`src/pss_net.c`); a host program reads and writes it and does the networking.
++All integers are little endian.
++
++| Offset | Size | Field | Writer | Meaning |
++|--------|------|-------|--------|---------|
++| 0x00 | 8 | magic | ROM | `PSSMBX01`. The host finds the mailbox by scanning EWRAM (0x02000000-0x0203FFFF) for this. |
++| 0x08 | 4 | version | ROM | `1` |
++| 0x0C | 4 | romSeq | ROM | Incremented after a request is fully written. |
++| 0x10 | 4 | hostSeq | host | Set to the `romSeq` value being answered, after the response is written. |
++| 0x14 | 4 | hostBeat | host | Incremented every frame while the host is alive. No change for 180 frames and the ROM shows OFFLINE. |
++| 0x18 | 1 | cmd | ROM | 1 PING, 2 HELLO, 3 PLAYER_LIST |
++| 0x19 | 1 | status | host | 0 OK, 1 ERROR, 2 UNSUPPORTED, 3 OFFLINE |
++| 0x1A | 2 | reqLen | ROM | Request payload length (max 64) |
++| 0x1C | 2 | respLen | host | Response payload length (max 64) |
++| 0x20 | 64 | req | ROM | Request payload |
++| 0x60 | 64 | resp | host | Response payload |
++
++## Handshake
++
++1. ROM writes `req`, `reqLen`, `cmd`, then increments `romSeq`.
++2. Host sees `romSeq != hostSeq`, captures `romSeq`, handles the request.
++3. Host writes `resp`, `respLen`, `status`, then sets `hostSeq` to the captured value.
++4. ROM sees `hostSeq == romSeq` and reads the response. No answer within 300 frames is a timeout.
++
++Before writing a response the host must re-read `romSeq`; if it changed, the
++ROM has moved on and the late answer must be dropped.
++
++## Payloads
++
++- `HELLO` request (16 bytes): name[8] (GBA charmap, 0xFF terminated), trainerId[4], gender[1], pad[3].
++  Response (8 bytes): sessionId[4], playersOnline[2], pad[2].
++- `PLAYER_LIST` request: empty. Response (4 + 12 x count bytes, at most 52): count[1], pad[3], then `count` entries of
++  name[8], gender[1], pad[3].
++- `PING`: empty both ways. The bridge answers it locally, so it works without a server.
++
++## Security notes
++
++Everything the server sends is untrusted. The ROM clamps lengths and strips
++control codes from names (`CopySanitizedName`). Keep that if you add commands,
++and validate any Pokémon data before it goes into the party or boxes.
+diff --git a/bridge/README.md b/bridge/README.md
+new file mode 100644
+index 0000000..d92e7e8
+--- /dev/null
++++ b/bridge/README.md
+@@ -0,0 +1,88 @@
++# Building and running the PSS bridge build
++
++## 1. Build the ROM (on your own machine)
++
++This repo is pret/pokefirered plus the PSS changes. Follow `INSTALL.md` to get
++devkitARM and agbcc, then:
++
++    make -j$(nproc)
++
++The output is `pokefirered.gba`. The change makes the ROM differ from the
++retail one, so `make compare` will report a mismatch; that is expected.
++Start menu -> **PSS** opens the hub screen.
++
++## 2. Choose a password
++
++Pick one shared password (at least 8 characters). It lives in exactly two kinds
++of place, and never in this repository:
++
++- on the server, as the `PSS_PASSWORD` setting, and
++- in each player's own copy of `pss_bridge.lua`, on the `local PASSWORD = ""` line.
++
++The password is never sent over the network. The server sends a random
++challenge, and the bridge answers with an HMAC-SHA256 proof computed from the
++password and that challenge. A recorded proof is useless for a later login.
++Five failed logins from one address in a minute lock that address out for five
++minutes.
++
++## 3. Run the relay server
++
++Local test (your own machine):
++
++    PSS_PASSWORD='your password' python3 bridge/relay_server.py --host 127.0.0.1 --port 7777
++
++Use single quotes in a shell so characters like `!` are not interpreted.
++
++### On a rented Linux server (Ubuntu)
++
++1. Copy `bridge/relay_server.py` to the server (`scp`), for example to `/opt/pss/`.
++2. Store the password in a file only root can read:
++
++       echo 'PSS_PASSWORD=your password' | sudo tee /etc/pss.env
++       sudo chmod 600 /etc/pss.env
++
++3. Create `/etc/systemd/system/pss.service`:
++
++       [Unit]
++       Description=PSS relay
++       After=network.target
++
++       [Service]
++       EnvironmentFile=/etc/pss.env
++       ExecStart=/usr/bin/python3 /opt/pss/relay_server.py --host 0.0.0.0 --port 7777
++       Restart=always
++       DynamicUser=yes
++       NoNewPrivileges=yes
++
++       [Install]
++       WantedBy=multi-user.target
++
++4. Start it: `sudo systemctl enable --now pss`, then check `systemctl status pss`.
++5. Open the port: `sudo ufw allow 7777/tcp` (and in the provider's firewall
++   panel, if it has one).
++
++## 4. Run the ROM with the bridge
++
++In each player's copy of `bridge/pss_bridge.lua`, set:
++
++    local SERVER_HOST = "your.server.ip.address"
++    local PASSWORD    = "the shared password"
++
++Open `pokefirered.gba` in mGBA 0.10 or newer, then Tools -> Scripting ->
++File -> Load script -> `bridge/pss_bridge.lua`. The log should print
++"mailbox found", then "connected to relay", then "logged in to the relay".
++In the game, the hub's top-right indicator shows ONLINE while the bridge is
++running. CONNECT sends your trainer name to the relay; PLAYER LIST shows others.
++
++If the log says the relay rejected the login, check the password on both
++sides. The bridge waits 60 seconds before trying again.
++
++## What is and is not protected
++
++The login keeps strangers out. Traffic after login (player names, trainer IDs)
++is not encrypted, so someone who can watch your network could read it. Do not
++put anything secret in the protocol. Wrapping the connection in TLS or SSH is
++the next step if that matters to you.
++
++See `PROTOCOL.md` for the mailbox format if you want to write a different
++host (a link-cable adapter, another emulator, etc.).
+diff --git a/bridge/pss_bridge.lua b/bridge/pss_bridge.lua
+new file mode 100644
+index 0000000..0aa4ebe
+--- /dev/null
++++ b/bridge/pss_bridge.lua
+@@ -0,0 +1,329 @@
++-- PSS bridge for mGBA (scripting API, mGBA 0.10+).
++-- Load via Tools > Scripting > File > Load script, with the ROM already running.
++-- Finds the PSS mailbox in EWRAM, forwards requests to relay_server.py over TCP,
++-- and writes the replies back. See PROTOCOL.md for the mailbox layout.
++
++local SERVER_HOST = "127.0.0.1"
++local SERVER_PORT = 7777
++-- The shared password for the relay server. Type it between the quotes, on YOUR
++-- copy of this file only. Never paste it into a shared or published copy.
++local PASSWORD = ""
++
++local EWRAM_BASE = 0x02000000
++local EWRAM_SIZE = 0x40000
++local MAGIC = "PSSMBX01"
++
++-- Mailbox offsets
++local OFF_VERSION, OFF_ROMSEQ, OFF_HOSTSEQ, OFF_BEAT = 0x08, 0x0C, 0x10, 0x14
++local OFF_CMD, OFF_STATUS, OFF_REQLEN, OFF_RESPLEN = 0x18, 0x19, 0x1A, 0x1C
++local OFF_REQ, OFF_RESP = 0x20, 0x60
++local PAYLOAD_MAX = 64
++
++local CMD_PING, CMD_HELLO, CMD_PLAYER_LIST = 1, 2, 3
++local ST_OK, ST_ERROR, ST_UNSUPPORTED, ST_OFFLINE = 0, 1, 2, 3
++
++local mailbox = nil        -- absolute address once found
++local lastSeen = 0         -- last romSeq we picked up
++local pending = nil        -- { seq = n, cmd = c } while waiting for the server
++local sock = nil
++local connected = false
++local authed = false      -- true once the relay accepted our password proof
++local warnedNoPassword = false
++local recvBuf = ""
++local reconnectAt = 0
++local frame = 0
++
++local function log(msg) console:log("[PSS] " .. msg) end
++
++local function toHex(s)
++  return (s:gsub(".", function(c) return string.format("%02x", c:byte()) end))
++end
++
++local function fromHex(h)
++  return (h:gsub("%x%x", function(x) return string.char(tonumber(x, 16)) end))
++end
++
++local function le(n, bytes)
++  local out = {}
++  for i = 1, bytes do
++    out[i] = string.char(n & 0xFF)
++    n = n >> 8
++  end
++  return table.concat(out)
++end
++
++-- Pure-Lua SHA-256 and HMAC-SHA256 (Lua 5.3/5.4 integer operators). Used for the
++-- login challenge so the password is never sent over the network.
++local SHA_K = {
++  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
++  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
++  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
++  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
++  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
++  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
++  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
++  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
++}
++
++local function rotr(x, n) return ((x >> n) | (x << (32 - n))) & 0xFFFFFFFF end
++
++local function sha256(msg)
++  local H = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
++              0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 }
++  local len = #msg
++  msg = msg .. "\128" .. string.rep("\0", (55 - len) % 64) .. string.pack(">I8", len * 8)
++  for chunk = 1, #msg, 64 do
++    local w = {}
++    for i = 0, 15 do w[i] = string.unpack(">I4", msg, chunk + i * 4) end
++    for i = 16, 63 do
++      local s0 = rotr(w[i - 15], 7) ~ rotr(w[i - 15], 18) ~ (w[i - 15] >> 3)
++      local s1 = rotr(w[i - 2], 17) ~ rotr(w[i - 2], 19) ~ (w[i - 2] >> 10)
++      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) & 0xFFFFFFFF
++    end
++    local a, b, c, d, e, f, g, h = table.unpack(H)
++    for i = 0, 63 do
++      local S1 = rotr(e, 6) ~ rotr(e, 11) ~ rotr(e, 25)
++      local ch = (e & f) ~ (~e & g)
++      local t1 = (h + S1 + ch + SHA_K[i + 1] + w[i]) & 0xFFFFFFFF
++      local S0 = rotr(a, 2) ~ rotr(a, 13) ~ rotr(a, 22)
++      local maj = (a & b) ~ (a & c) ~ (b & c)
++      local t2 = (S0 + maj) & 0xFFFFFFFF
++      h, g, f, e = g, f, e, (d + t1) & 0xFFFFFFFF
++      d, c, b, a = c, b, a, (t1 + t2) & 0xFFFFFFFF
++    end
++    H[1] = (H[1] + a) & 0xFFFFFFFF; H[2] = (H[2] + b) & 0xFFFFFFFF
++    H[3] = (H[3] + c) & 0xFFFFFFFF; H[4] = (H[4] + d) & 0xFFFFFFFF
++    H[5] = (H[5] + e) & 0xFFFFFFFF; H[6] = (H[6] + f) & 0xFFFFFFFF
++    H[7] = (H[7] + g) & 0xFFFFFFFF; H[8] = (H[8] + h) & 0xFFFFFFFF
++  end
++  return string.pack(">I4I4I4I4I4I4I4I4", table.unpack(H))
++end
++
++local function hmacSha256Hex(key, msg)
++  if #key > 64 then key = sha256(key) end
++  key = key .. string.rep("\0", 64 - #key)
++  local ipad, opad = {}, {}
++  for i = 1, 64 do
++    local k = key:byte(i)
++    ipad[i] = string.char(k ~ 0x36)
++    opad[i] = string.char(k ~ 0x5c)
++  end
++  local inner = sha256(table.concat(ipad) .. msg)
++  local out = sha256(table.concat(opad) .. inner)
++  return (out:gsub(".", function(c) return string.format("%02x", c:byte()) end))
++end
++
++-- Exposed only so the crypto can be checked against known test vectors.
++PssCrypto = { sha256 = sha256, hmacHex = hmacSha256Hex }
++
++local function findMailbox()
++  local data = emu:readRange(EWRAM_BASE, EWRAM_SIZE)
++  local pos = data:find(MAGIC, 1, true)
++  if not pos then return nil end
++  local addr = EWRAM_BASE + pos - 1
++  if emu:read32(addr + OFF_VERSION) ~= 1 then
++    log("mailbox version mismatch, ignoring")
++    return nil
++  end
++  return addr
++end
++
++local function mailboxStillValid()
++  local data = emu:readRange(mailbox, 8)
++  return data == MAGIC
++end
++
++-- Write a response and publish it. Dropped if the ROM has moved on.
++local function respond(seq, status, payload)
++  if emu:read32(mailbox + OFF_ROMSEQ) ~= seq then return end
++  payload = payload or ""
++  if #payload > PAYLOAD_MAX then payload = payload:sub(1, PAYLOAD_MAX) end
++  for i = 1, #payload do
++    emu:write8(mailbox + OFF_RESP + i - 1, payload:byte(i))
++  end
++  emu:write16(mailbox + OFF_RESPLEN, #payload)
++  emu:write8(mailbox + OFF_STATUS, status)
++  emu:write32(mailbox + OFF_HOSTSEQ, seq) -- published last
++end
++
++local function connectServer()
++  if PASSWORD == "" then
++    reconnectAt = frame + 600
++    if not warnedNoPassword then
++      warnedNoPassword = true
++      log("no PASSWORD set at the top of pss_bridge.lua; not connecting to the relay")
++    end
++    return
++  end
++  sock = socket.tcp()
++  local ok = sock:connect(SERVER_HOST, SERVER_PORT)
++  if ok then
++    connected = true
++    authed = false
++    recvBuf = ""
++    log("connected to relay " .. SERVER_HOST .. ":" .. SERVER_PORT)
++  else
++    connected = false
++    sock = nil
++    reconnectAt = frame + 300 -- retry in ~5 seconds
++  end
++end
++
++local function dropServer(retryFrames)
++  if sock then sock:close() end
++  sock, connected, authed, recvBuf = nil, false, false, ""
++  reconnectAt = frame + (retryFrames or 300)
++  if pending then
++    respond(pending.seq, ST_OFFLINE, "")
++    pending = nil
++  end
++end
++
++local function sendLine(line)
++  local ok = sock and sock:send(line .. "\n")
++  if not ok then dropServer() return false end
++  return true
++end
++
++-- Turn a server reply line into a mailbox response for the pending request.
++local function handleReply(line)
++  if not pending then return end
++  local seq, cmd = pending.seq, pending.cmd
++  pending = nil
++
++  if line:sub(1, 3) ~= "OK " then
++    respond(seq, ST_ERROR, "")
++    return
++  end
++
++  if cmd == CMD_HELLO then
++    local sid, online = line:match("^OK HELLO (%d+) (%d+)$")
++    if not sid then respond(seq, ST_ERROR, "") return end
++    respond(seq, ST_OK, le(tonumber(sid), 4) .. le(tonumber(online), 2) .. "\0\0")
++  elseif cmd == CMD_PLAYER_LIST then
++    local count = tonumber(line:match("^OK PLAYERS (%d+)"))
++    if not count then respond(seq, ST_ERROR, "") return end
++    if count > 4 then count = 4 end
++    local out = { string.char(count), "\0\0\0" }
++    local n = 0
++    for name, gender in line:gmatch("(%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x):([01])") do
++      if n >= count then break end
++      out[#out + 1] = fromHex(name) .. string.char(tonumber(gender)) .. "\0\0\0"
++      n = n + 1
++    end
++    -- Fewer entries than announced: report what we actually have.
++    out[1] = string.char(n)
++    respond(seq, ST_OK, table.concat(out))
++  else
++    respond(seq, ST_UNSUPPORTED, "")
++  end
++end
++
++-- Login messages come first, then ordinary replies.
++local function handleLine(line)
++  local nonce = line:match("^CHALLENGE (%x+)$")
++  if nonce then
++    sendLine("AUTH " .. hmacSha256Hex(PASSWORD, nonce))
++    return
++  end
++  if not authed then
++    if line == "OK AUTH" then
++      authed = true
++      log("logged in to the relay")
++    else
++      -- ERR auth / ERR refused. Wait a long time before retrying: the server
++      -- locks out addresses that fail several times in a minute.
++      log("relay rejected the login (" .. line .. "); check PASSWORD. Retrying in 60 seconds")
++      dropServer(3600)
++    end
++    return
++  end
++  handleReply(line)
++end
++
++local function pollServer()
++  if not connected then return end
++  local chunk, err = sock:receive(512)
++  if chunk then
++    recvBuf = recvBuf .. chunk
++    if #recvBuf > 4096 then dropServer() return end
++    while true do
++      local nl = recvBuf:find("\n", 1, true)
++      if not nl then break end
++      local line = recvBuf:sub(1, nl - 1)
++      recvBuf = recvBuf:sub(nl + 1)
++      handleLine(line)
++      if not connected then return end
++    end
++  elseif err and err ~= socket.ERRORS.AGAIN and err ~= "timeout" then
++    log("relay connection lost")
++    dropServer()
++  end
++end
++
++local function pickUpRequest()
++  local romSeq = emu:read32(mailbox + OFF_ROMSEQ)
++  if romSeq == lastSeen then return end
++  lastSeen = romSeq
++  if emu:read32(mailbox + OFF_HOSTSEQ) == romSeq then return end
++
++  local cmd = emu:read8(mailbox + OFF_CMD)
++  local reqLen = emu:read16(mailbox + OFF_REQLEN)
++  if reqLen > PAYLOAD_MAX then respond(romSeq, ST_ERROR, "") return end
++  local req = reqLen > 0 and emu:readRange(mailbox + OFF_REQ, reqLen) or ""
++
++  -- A newer request supersedes any older one still in flight.
++  pending = nil
++
++  if cmd == CMD_PING then
++    respond(romSeq, ST_OK, "")
++    return
++  end
++
++  if not (connected and authed) then respond(romSeq, ST_OFFLINE, "") return end
++
++  if cmd == CMD_HELLO then
++    if #req < 13 then respond(romSeq, ST_ERROR, "") return end
++    local name = toHex(req:sub(1, 8))
++    local tid = toHex(req:sub(9, 12))
++    local gender = req:byte(13) == 1 and 1 or 0
++    pending = { seq = romSeq, cmd = cmd }
++    sendLine(string.format("HELLO %s %s %d", name, tid, gender))
++  elseif cmd == CMD_PLAYER_LIST then
++    pending = { seq = romSeq, cmd = cmd }
++    sendLine("PLAYERS")
++  else
++    respond(romSeq, ST_UNSUPPORTED, "")
++  end
++end
++
++local function onFrame()
++  frame = frame + 1
++
++  if not mailbox then
++    if frame % 60 == 0 then
++      mailbox = findMailbox()
++      if mailbox then
++        lastSeen = emu:read32(mailbox + OFF_ROMSEQ)
++        log(string.format("mailbox found at 0x%08X", mailbox))
++      end
++    end
++    return
++  end
++
++  -- Soft reset or a different ROM: the mailbox vanished, search again.
++  if frame % 120 == 0 and not mailboxStillValid() then
++    log("mailbox lost, searching again")
++    mailbox, pending = nil, nil
++    return
++  end
++
++  emu:write32(mailbox + OFF_BEAT, (emu:read32(mailbox + OFF_BEAT) + 1) & 0xFFFFFFFF)
++
++  if not connected and frame >= reconnectAt then connectServer() end
++  pollServer()
++  pickUpRequest()
++end
++
++callbacks:add("frame", onFrame)
++log("bridge loaded; waiting for the ROM's mailbox")
+diff --git a/bridge/relay_server.py b/bridge/relay_server.py
+new file mode 100644
+index 0000000..f75ce15
+--- /dev/null
++++ b/bridge/relay_server.py
+@@ -0,0 +1,221 @@
++#!/usr/bin/env python3
++"""PSS relay server (reference implementation) with password login.
++
++Line-based text protocol over TCP, one request per line, one reply per line.
++
++Login (first thing on every connection):
++  server -> CHALLENGE <32 hex chars, random>
++  client -> AUTH <hex HMAC-SHA256(key=password, message=the 32 hex chars as ASCII)>
++  server -> OK AUTH          (or ERR auth and the connection is closed)
++The password itself is never sent over the network.
++
++After login:
++  HELLO <name:16 hex> <trainer id:8 hex> <gender:0|1>
++      -> OK HELLO <session id> <players online>
++  PLAYERS
++      -> OK PLAYERS <count> [<name:16 hex>:<gender> ...]      (others only, max 4)
++  anything else
++      -> ERR <reason>
++
++The password is read from the PSS_PASSWORD environment variable, or from a file
++with --password-file. It is deliberately not a command-line argument (those show
++up in process listings) and is never written into this repository.
++
++Note: login proves who may join, but the traffic after login is not encrypted.
++For private data you would put this behind a TLS tunnel or SSH.
++
++Run:  PSS_PASSWORD='your password' python3 relay_server.py --host 0.0.0.0 --port 7777
++"""
++import argparse
++import asyncio
++import hashlib
++import hmac
++import os
++import random
++import re
++import secrets
++import sys
++import time
++
++MAX_LINE = 256
++MAX_LISTED = 4
++MIN_INTERVAL = 0.1       # seconds between requests per connection
++AUTH_TIMEOUT = 10.0      # seconds to answer the challenge
++MAX_CONNECTIONS = 64
++MAX_PER_IP = 4
++MAX_FAILURES = 5         # failed logins from one IP ...
++FAILURE_WINDOW = 60.0    # ... within this many seconds ...
++BLOCK_SECONDS = 300.0    # ... blocks that IP for this long
++MIN_PASSWORD_LEN = 8
++
++HEX16 = re.compile(r"^[0-9a-fA-F]{16}$")
++HEX8 = re.compile(r"^[0-9a-fA-F]{8}$")
++HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
++
++players = {}        # session id -> {"name": hex, "gender": int}
++conns_per_ip = {}   # ip -> open connection count
++failures = {}       # ip -> list of failure timestamps
++blocked_until = {}  # ip -> monotonic time
++
++
++def expected_proof(password: bytes, nonce_hex: str) -> str:
++    return hmac.new(password, nonce_hex.encode("ascii"), hashlib.sha256).hexdigest()
++
++
++def handle_line(session, line):
++    parts = line.split()
++    if not parts:
++        return "ERR empty"
++    op = parts[0].upper()
++
++    if op == "HELLO":
++        if len(parts) != 4 or not HEX16.match(parts[1]) or not HEX8.match(parts[2]) \
++                or parts[3] not in ("0", "1"):
++            return "ERR bad hello"
++        players[session] = {"name": parts[1].lower(), "gender": int(parts[3])}
++        return f"OK HELLO {session} {len(players)}"
++
++    if op == "PLAYERS":
++        if session not in players:
++            return "ERR not connected"
++        others = [p for sid, p in players.items() if sid != session][:MAX_LISTED]
++        entries = " ".join(f"{p['name']}:{p['gender']}" for p in others)
++        return f"OK PLAYERS {len(others)}" + (f" {entries}" if entries else "")
++
++    return "ERR unknown op"
++
++
++def is_blocked(ip):
++    until = blocked_until.get(ip)
++    if until is None:
++        return False
++    if time.monotonic() >= until:
++        del blocked_until[ip]
++        failures.pop(ip, None)
++        return False
++    return True
++
++
++def record_failure(ip):
++    now = time.monotonic()
++    recent = [t for t in failures.get(ip, []) if now - t < FAILURE_WINDOW]
++    recent.append(now)
++    failures[ip] = recent
++    if len(recent) >= MAX_FAILURES:
++        blocked_until[ip] = now + BLOCK_SECONDS
++        print(f"! blocking {ip} for {int(BLOCK_SECONDS)}s after repeated failed logins")
++
++
++async def authenticate(reader, writer, password, ip):
++    nonce = secrets.token_hex(16)
++    writer.write(f"CHALLENGE {nonce}\n".encode("ascii"))
++    await writer.drain()
++    try:
++        raw = await asyncio.wait_for(reader.readuntil(b"\n"), AUTH_TIMEOUT)
++    except (asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
++        record_failure(ip)
++        return False
++    parts = raw.decode("ascii", "replace").split()
++    ok = (len(parts) == 2 and parts[0].upper() == "AUTH" and HEX64.match(parts[1]) is not None
++          and hmac.compare_digest(parts[1].lower(), expected_proof(password, nonce)))
++    if not ok:
++        record_failure(ip)
++        writer.write(b"ERR auth\n")
++        await writer.drain()
++        return False
++    writer.write(b"OK AUTH\n")
++    await writer.drain()
++    return True
++
++
++def make_client_handler(password):
++    async def client(reader, writer):
++        peer = writer.get_extra_info("peername") or ("?", 0)
++        ip = peer[0]
++        session = None
++        counted = False
++        try:
++            if is_blocked(ip) or sum(conns_per_ip.values()) >= MAX_CONNECTIONS \
++                    or conns_per_ip.get(ip, 0) >= MAX_PER_IP:
++                writer.write(b"ERR refused\n")
++                await writer.drain()
++                return
++            conns_per_ip[ip] = conns_per_ip.get(ip, 0) + 1
++            counted = True
++
++            if password is not None and not await authenticate(reader, writer, password, ip):
++                print(f"x {ip} failed login")
++                return
++
++            session = random.getrandbits(32)
++            while session in players:
++                session = random.getrandbits(32)
++            print(f"+ {ip} session {session}")
++
++            last = 0.0
++            while True:
++                try:
++                    raw = await reader.readuntil(b"\n")
++                except asyncio.LimitOverrunError:
++                    break
++                if len(raw) > MAX_LINE:
++                    writer.write(b"ERR too long\n")
++                    break
++                now = time.monotonic()
++                if now - last < MIN_INTERVAL:
++                    writer.write(b"ERR slow down\n")
++                    await writer.drain()
++                    continue
++                last = now
++                reply = handle_line(session, raw.decode("ascii", "replace").strip())
++                writer.write(reply.encode("ascii") + b"\n")
++                await writer.drain()
++        except (asyncio.IncompleteReadError, ConnectionError):
++            pass
++        finally:
++            if session is not None:
++                players.pop(session, None)
++                print(f"- {ip} session {session}")
++            if counted:
++                conns_per_ip[ip] -= 1
++                if conns_per_ip[ip] <= 0:
++                    del conns_per_ip[ip]
++            writer.close()
++    return client
++
++
++def load_password(args):
++    if args.insecure_no_auth:
++        return None
++    if args.password_file:
++        with open(args.password_file, "rb") as f:
++            pw = f.read().rstrip(b"\r\n")
++    else:
++        env = os.environ.get("PSS_PASSWORD")
++        pw = env.encode("utf-8") if env else b""
++    if len(pw) < MIN_PASSWORD_LEN:
++        sys.exit(f"Set a password of at least {MIN_PASSWORD_LEN} characters in the PSS_PASSWORD "
++                 "environment variable (or use --password-file). Use --insecure-no-auth only "
++                 "for local testing.")
++    return pw
++
++
++async def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--host", default="127.0.0.1")
++    ap.add_argument("--port", type=int, default=7777)
++    ap.add_argument("--password-file", help="file whose first line is the password")
++    ap.add_argument("--insecure-no-auth", action="store_true",
++                    help="disable the password check (local testing only)")
++    args = ap.parse_args()
++    password = load_password(args)
++    server = await asyncio.start_server(make_client_handler(password), args.host, args.port,
++                                        limit=MAX_LINE * 2)
++    mode = "NO PASSWORD (insecure)" if password is None else "password required"
++    print(f"PSS relay listening on {args.host}:{args.port} - {mode}")
++    async with server:
++        await server.serve_forever()
++
++
++if __name__ == "__main__":
++    asyncio.run(main())
+diff --git a/include/pss_hub.h b/include/pss_hub.h
+new file mode 100644
+index 0000000..3a792f6
+--- /dev/null
++++ b/include/pss_hub.h
+@@ -0,0 +1,6 @@
++#ifndef GUARD_PSS_HUB_H
++#define GUARD_PSS_HUB_H
++
++void CB2_ShowPssHub(void);
++
++#endif // GUARD_PSS_HUB_H
+diff --git a/include/pss_net.h b/include/pss_net.h
+new file mode 100644
+index 0000000..88e1941
+--- /dev/null
++++ b/include/pss_net.h
+@@ -0,0 +1,90 @@
++#ifndef GUARD_PSS_NET_H
++#define GUARD_PSS_NET_H
++
++// PSS network bridge: a fixed-layout mailbox in EWRAM that an external host
++// (emulator script, link-cable adapter firmware, etc.) reads and writes.
++// The GBA has no network hardware, so the ROM never touches a socket. It posts
++// a request into the mailbox and polls for the host's response.
++//
++// The host locates the mailbox by scanning EWRAM for PSS_MAILBOX_MAGIC.
++// Protocol reference: bridge/PROTOCOL.md
++
++#define PSS_MAILBOX_MAGIC      "PSSMBX01"
++#define PSS_MAILBOX_VERSION    1
++#define PSS_PAYLOAD_MAX        64
++
++// Frames without a host heartbeat change before the host counts as gone.
++#define PSS_HOST_TIMEOUT_FRAMES 180
++// Frames to wait for a response to a request before giving up.
++#define PSS_REQUEST_TIMEOUT_FRAMES 300
++
++// Commands (ROM -> host)
++enum PssCmd
++{
++    PSS_CMD_NONE = 0,
++    PSS_CMD_PING,         // req: empty.                  resp: empty
++    PSS_CMD_HELLO,        // req: PssHelloReq.            resp: PssHelloResp
++    PSS_CMD_PLAYER_LIST,  // req: empty.                  resp: PssPlayerListResp
++};
++
++// Response status (host -> ROM)
++enum PssStatus
++{
++    PSS_STATUS_OK = 0,
++    PSS_STATUS_ERROR,        // host understood the request and refused it
++    PSS_STATUS_UNSUPPORTED,  // unknown command
++    PSS_STATUS_OFFLINE,      // host is up but the server is unreachable
++};
++
++// Client-side request state
++enum PssRequestState
++{
++    PSS_REQ_IDLE = 0,
++    PSS_REQ_PENDING,
++    PSS_REQ_DONE,
++    PSS_REQ_TIMED_OUT,
++};
++
++#define PSS_NAME_LEN        8   // PLAYER_NAME_LENGTH (7) + terminator, GBA charmap
++#define PSS_MAX_LISTED      4
++
++struct PssHelloReq
++{
++    u8 name[PSS_NAME_LEN];       // GBA-encoded player name, 0xFF terminated
++    u8 trainerId[4];             // gSaveBlock2Ptr->playerTrainerId (little endian)
++    u8 gender;
++    u8 pad[3];
++};
++
++struct PssHelloResp
++{
++    u8 sessionId[4];
++    u8 playersOnline[2];         // little endian u16
++    u8 pad[2];
++};
++
++struct PssPlayerEntry
++{
++    u8 name[PSS_NAME_LEN];
++    u8 gender;
++    u8 pad[3];
++};
++
++struct PssPlayerListResp
++{
++    u8 count;                    // <= PSS_MAX_LISTED
++    u8 pad[3];
++    struct PssPlayerEntry players[PSS_MAX_LISTED];
++};
++
++void PssNet_Init(void);
++void PssNet_Update(void);        // call once per frame from the main loop
++bool8 PssNet_IsHostPresent(void);
++bool8 PssNet_Send(u8 cmd, const void *data, u16 len);
++u8 PssNet_GetRequestState(void);
++// Valid only when the request state is PSS_REQ_DONE. Returns the response
++// payload and writes its length/status. Marks the mailbox idle again.
++const u8 *PssNet_TakeResponse(u16 *len, u8 *status);
++void PssNet_Cancel(void);
++
++#endif // GUARD_PSS_NET_H
+diff --git a/include/strings.h b/include/strings.h
+index 57066f7..5018a05 100644
+--- a/include/strings.h
++++ b/include/strings.h
+@@ -628,6 +628,7 @@ extern const u8 gText_MenuBag[];
+ extern const u8 gText_MenuPlayer[];
+ extern const u8 gText_MenuSave[];
+ extern const u8 gText_MenuOption[];
++extern const u8 gText_MenuPss[];
+ extern const u8 gText_MenuExit[];
+ extern const u8 gText_MenuRetire[];
+ extern const u8 gText_MenuSafariStats[];
+@@ -635,6 +636,7 @@ extern const u8 gStartMenuDesc_Pokedex[];
+ extern const u8 gStartMenuDesc_Pokemon[];
+ extern const u8 gStartMenuDesc_Bag[];
+ extern const u8 gStartMenuDesc_Save[];
++extern const u8 gStartMenuDesc_Pss[];
+ extern const u8 gStartMenuDesc_Option[];
+ extern const u8 gStartMenuDesc_Exit[];
+ extern const u8 gStartMenuDesc_Retire[];
+diff --git a/ld_script.ld b/ld_script.ld
+index 9a4b450..aed1975 100644
+--- a/ld_script.ld
++++ b/ld_script.ld
+@@ -294,6 +294,8 @@ SECTIONS {
+         src/pokemon_jump.o(.text);
+         src/berry_crush.o(.text);
+         src/wireless_communication_status_screen.o(.text);
++        src/pss_net.o(.text);
++        src/pss_hub.o(.text);
+         src/braille_text.o(.text);
+         src/text_window.o(.text);
+         src/quest_log_player.o(.text);
+@@ -591,6 +593,8 @@ SECTIONS {
+         src/pokemon_jump.o(.rodata);
+         src/berry_crush.o(.rodata);
+         src/wireless_communication_status_screen.o(.rodata);
++        src/pss_net.o(.rodata);
++        src/pss_hub.o(.rodata);
+         src/braille_text.o(.rodata);
+         src/text_window_graphics.o(.rodata);
+         src/quest_log_player.o(.rodata);
+diff --git a/ld_script_rev10.ld b/ld_script_rev10.ld
+index 4eb3bc2..683a663 100644
+--- a/ld_script_rev10.ld
++++ b/ld_script_rev10.ld
+@@ -296,6 +296,8 @@ SECTIONS {
+         src/pokemon_jump.o(.text);
+         src/berry_crush.o(.text);
+         src/wireless_communication_status_screen.o(.text);
++        src/pss_net.o(.text);
++        src/pss_hub.o(.text);
+         src/braille_text.o(.text);
+         src/text_window.o(.text);
+         src/quest_log_player.o(.text);
+@@ -592,6 +594,8 @@ SECTIONS {
+         src/pokemon_jump.o(.rodata);
+         src/berry_crush.o(.rodata);
+         src/wireless_communication_status_screen.o(.rodata);
++        src/pss_net.o(.rodata);
++        src/pss_hub.o(.rodata);
+         src/braille_text.o(.rodata);
+         src/text_window_graphics.o(.rodata);
+         src/quest_log_player.o(.rodata);
+diff --git a/src/main.c b/src/main.c
+index 542b0f5..714f155 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -16,6 +16,7 @@
+ #include "save_failed_screen.h"
+ #include "quest_log.h"
+ #include "sloopsvc.h"
++#include "pss_net.h"
+ 
+ extern u32 intr_main[];
+ 
+@@ -146,6 +147,7 @@ void AgbMain()
+     m4aSoundInit();
+     EnableVCountIntrAtLine150();
+     InitRFU();
++    PssNet_Init();
+     CheckForFlashMemory();
+     InitMainCallbacks();
+     InitMapMusic();
+@@ -213,6 +215,7 @@ void AgbMain()
+ 
+         PlayTimeCounter_Update();
+         MapMusicMain();
++        PssNet_Update();
+         WaitForVBlank();
+     }
+ }
+diff --git a/src/pss_hub.c b/src/pss_hub.c
+new file mode 100644
+index 0000000..71023bc
+--- /dev/null
++++ b/src/pss_hub.c
+@@ -0,0 +1,531 @@
++#include "global.h"
++#include "gflib.h"
++#include "task.h"
++#include "new_menu_helpers.h"
++#include "scanline_effect.h"
++#include "m4a.h"
++#include "menu.h"
++#include "overworld.h"
++#include "string_util.h"
++#include "strings.h"
++#include "pss_net.h"
++#include "pss_hub.h"
++#include "constants/songs.h"
++
++// Player Search System hub. The layout borrows the blue background of the
++// wireless communication status screen, so no new graphics are needed.
++
++enum {
++    COLOR_NORMAL,
++    COLOR_SELECTED,
++    COLOR_TITLE,
++    COLOR_ONLINE,
++    COLOR_OFFLINE,
++};
++
++enum {
++    WIN_TITLE,
++    WIN_MENU,
++    WIN_INFO,
++};
++
++enum {
++    MENU_CONNECT,
++    MENU_PLAYER_LIST,
++    MENU_EXIT,
++    NUM_MENU_ITEMS
++};
++
++enum {
++    STATE_INIT,
++    STATE_FADE_IN,
++    STATE_WAIT_FADE_IN,
++    STATE_INPUT,
++    STATE_WAIT_RESPONSE,
++    STATE_FADE_OUT,
++    STATE_EXIT,
++};
++
++static struct
++{
++    u8 taskId;
++    u8 cursor;
++    u8 pendingCmd;
++    u8 hostWasPresent;
++} *sHub;
++
++static const u16 sPalette[] = INCBIN_U16("graphics/wireless_status_screen/default.gbapal");
++static const u32 sBgTiles_Gfx[] = INCBIN_U32("graphics/wireless_status_screen/bg.4bpp.lz");
++static const u16 sBgTiles_Tilemap[] = INCBIN_U16("graphics/wireless_status_screen/bg.bin");
++
++static const struct BgTemplate sBgTemplates[] = {
++    {
++        .bg = 0,
++        .charBaseIndex = 2,
++        .mapBaseIndex = 31,
++        .screenSize = 0,
++        .paletteMode = 0,
++        .priority = 0,
++        .baseTile = 0x000
++    }, {
++        .bg = 1,
++        .charBaseIndex = 0,
++        .mapBaseIndex =  8,
++        .screenSize = 0,
++        .paletteMode = 0,
++        .priority = 1,
++        .baseTile = 0x000
++    }
++};
++
++static const struct WindowTemplate sWindowTemplates[] = {
++    [WIN_TITLE] = {
++        .bg = 0,
++        .tilemapLeft = 3,
++        .tilemapTop = 0,
++        .width = 24,
++        .height = 3,
++        .paletteNum = 15,
++        .baseBlock = 0x001
++    },
++    [WIN_MENU] = {
++        .bg = 0,
++        .tilemapLeft = 3,
++        .tilemapTop = 4,
++        .width = 22,
++        .height = 6,
++        .paletteNum = 15,
++        .baseBlock = 0x049
++    },
++    [WIN_INFO] = {
++        .bg = 0,
++        .tilemapLeft = 3,
++        .tilemapTop = 10,
++        .width = 24,
++        .height = 9,
++        .paletteNum = 15,
++        .baseBlock = 0x0CD
++    },
++    DUMMY_WIN_TEMPLATE
++};
++
++static const u8 sText_Title[] = _("PLAYER SEARCH SYSTEM");
++static const u8 sText_Online[] = _("ONLINE");
++static const u8 sText_Offline[] = _("OFFLINE");
++static const u8 sText_Connect[] = _("CONNECT");
++static const u8 sText_PlayerList[] = _("PLAYER LIST");
++static const u8 sText_Exit[] = _("EXIT");
++static const u8 sText_Idle[] = _("Choose CONNECT to reach the\nPSS network.");
++static const u8 sText_NoHost[] = _("No network bridge found.\nStart the bridge and try\nagain.");
++static const u8 sText_Contacting[] = _("Contacting the server...\nPress B to cancel.");
++static const u8 sText_TimedOut[] = _("The server did not answer.\nTry again in a moment.");
++static const u8 sText_Refused[] = _("The server refused the\nrequest.");
++static const u8 sText_ServerDown[] = _("The bridge is running but\nthe server is unreachable.");
++static const u8 sText_BadReply[] = _("Received an invalid reply.");
++static const u8 sText_NobodyOnline[] = _("Nobody else is online\nright now.");
++static const u8 sText_PlayersOnline[] = _(" player(s) online.");
++static const u8 sText_PlayersListed[] = _("Players nearby:\n");
++static const u8 sText_Connected[] = _("Connected! ");
++static const u8 sText_NewLine[] = _("\n");
++
++static const u8 *const sMenuTexts[NUM_MENU_ITEMS] = {
++    [MENU_CONNECT]     = sText_Connect,
++    [MENU_PLAYER_LIST] = sText_PlayerList,
++    [MENU_EXIT]        = sText_Exit,
++};
++
++static void CB2_InitPssHub(void);
++static void CB2_RunPssHub(void);
++static void VBlankCB_PssHub(void);
++static void Task_PssHub(u8 taskId);
++static void ExitPssHub(void);
++
++static void AddText(u8 windowId, const u8 *str, u8 x, u8 y, u8 mode)
++{
++    u8 textColor[3];
++
++    textColor[0] = TEXT_COLOR_TRANSPARENT;
++    switch (mode)
++    {
++    default:
++    case COLOR_NORMAL:
++        textColor[1] = TEXT_COLOR_WHITE;
++        textColor[2] = TEXT_COLOR_LIGHT_GRAY;
++        break;
++    case COLOR_SELECTED:
++        textColor[1] = TEXT_COLOR_RED;
++        textColor[2] = TEXT_COLOR_LIGHT_RED;
++        break;
++    case COLOR_TITLE:
++        textColor[1] = TEXT_COLOR_LIGHT_GREEN;
++        textColor[2] = TEXT_COLOR_GREEN;
++        break;
++    case COLOR_ONLINE:
++        textColor[1] = TEXT_COLOR_LIGHT_GREEN;
++        textColor[2] = TEXT_COLOR_GREEN;
++        break;
++    case COLOR_OFFLINE:
++        textColor[1] = TEXT_COLOR_RED;
++        textColor[2] = TEXT_COLOR_LIGHT_RED;
++        break;
++    }
++    AddTextPrinterParameterized4(windowId, FONT_NORMAL_COPY_2, x, y, 1, 0, textColor, TEXT_SKIP_DRAW, str);
++}
++
++static void PrintTitle(void)
++{
++    const u8 *status;
++    u8 mode;
++    u32 width;
++
++    FillWindowPixelBuffer(WIN_TITLE, PIXEL_FILL(0));
++    AddText(WIN_TITLE, sText_Title, 4, 6, COLOR_TITLE);
++
++    if (PssNet_IsHostPresent())
++    {
++        status = sText_Online;
++        mode = COLOR_ONLINE;
++    }
++    else
++    {
++        status = sText_Offline;
++        mode = COLOR_OFFLINE;
++    }
++    width = GetStringWidth(FONT_NORMAL_COPY_2, status, 0);
++    AddText(WIN_TITLE, status, 188 - width, 6, mode);
++
++    PutWindowTilemap(WIN_TITLE);
++    CopyWindowToVram(WIN_TITLE, COPYWIN_FULL);
++}
++
++static void PrintMenu(void)
++{
++    s32 i;
++
++    FillWindowPixelBuffer(WIN_MENU, PIXEL_FILL(0));
++    for (i = 0; i < NUM_MENU_ITEMS; i++)
++        AddText(WIN_MENU, sMenuTexts[i], 4, 16 * i + 2, i == sHub->cursor ? COLOR_SELECTED : COLOR_NORMAL);
++
++    PutWindowTilemap(WIN_MENU);
++    CopyWindowToVram(WIN_MENU, COPYWIN_FULL);
++}
++
++static void PrintInfo(const u8 *str)
++{
++    FillWindowPixelBuffer(WIN_INFO, PIXEL_FILL(0));
++    AddText(WIN_INFO, str, 4, 2, COLOR_NORMAL);
++    PutWindowTilemap(WIN_INFO);
++    CopyWindowToVram(WIN_INFO, COPYWIN_FULL);
++}
++
++// Names arrive from the network and must not be trusted: stop at the first
++// terminator, and replace anything in the control-code range with '?'.
++static void CopySanitizedName(u8 *dst, const u8 *src)
++{
++    s32 i;
++
++    for (i = 0; i < PLAYER_NAME_LENGTH; i++)
++    {
++        u8 c = src[i];
++
++        if (c == EOS)
++            break;
++        if (c >= 0xF0)
++            c = CHAR_QUESTION_MARK;
++        dst[i] = c;
++    }
++    dst[i] = EOS;
++}
++
++static void SendHello(void)
++{
++    struct PssHelloReq req;
++    s32 i;
++
++    memset(&req, 0, sizeof(req));
++    for (i = 0; i < PLAYER_NAME_LENGTH + 1; i++)
++        req.name[i] = gSaveBlock2Ptr->playerName[i];
++    for (i = 0; i < TRAINER_ID_LENGTH; i++)
++        req.trainerId[i] = gSaveBlock2Ptr->playerTrainerId[i];
++    req.gender = gSaveBlock2Ptr->playerGender;
++    PssNet_Send(PSS_CMD_HELLO, &req, sizeof(req));
++}
++
++static void StartRequest(u8 cmd)
++{
++    if (!PssNet_IsHostPresent())
++    {
++        PrintInfo(sText_NoHost);
++        return;
++    }
++
++    if (cmd == PSS_CMD_HELLO)
++        SendHello();
++    else
++        PssNet_Send(cmd, NULL, 0);
++
++    sHub->pendingCmd = cmd;
++    PrintInfo(sText_Contacting);
++}
++
++static void ShowHelloResult(const u8 *data, u16 len)
++{
++    const struct PssHelloResp *resp = (const struct PssHelloResp *)data;
++    u16 online;
++
++    if (len < sizeof(*resp))
++    {
++        PrintInfo(sText_BadReply);
++        return;
++    }
++
++    online = resp->playersOnline[0] | (resp->playersOnline[1] << 8);
++    StringCopy(gStringVar4, sText_Connected);
++    ConvertIntToDecimalStringN(gStringVar1, online, STR_CONV_MODE_LEFT_ALIGN, 4);
++    StringAppend(gStringVar4, gStringVar1);
++    StringAppend(gStringVar4, sText_PlayersOnline);
++    PrintInfo(gStringVar4);
++}
++
++static void ShowPlayerListResult(const u8 *data, u16 len)
++{
++    const struct PssPlayerListResp *resp = (const struct PssPlayerListResp *)data;
++    s32 i;
++    u8 count;
++
++    // The host sends only as many entries as there are players, so the reply
++    // may be shorter than the full struct. Never read past what arrived.
++    if (len < offsetof(struct PssPlayerListResp, players))
++    {
++        PrintInfo(sText_BadReply);
++        return;
++    }
++
++    count = resp->count;
++    if (count > PSS_MAX_LISTED)
++        count = PSS_MAX_LISTED;
++    if (count > (len - offsetof(struct PssPlayerListResp, players)) / sizeof(struct PssPlayerEntry))
++        count = (len - offsetof(struct PssPlayerListResp, players)) / sizeof(struct PssPlayerEntry);
++    if (count == 0)
++    {
++        PrintInfo(sText_NobodyOnline);
++        return;
++    }
++
++    StringCopy(gStringVar4, sText_PlayersListed);
++    for (i = 0; i < count; i++)
++    {
++        CopySanitizedName(gStringVar1, resp->players[i].name);
++        StringAppend(gStringVar4, gStringVar1);
++        StringAppend(gStringVar4, sText_NewLine);
++    }
++    PrintInfo(gStringVar4);
++}
++
++static void HandleResponse(void)
++{
++    u16 len;
++    u8 status;
++    const u8 *data = PssNet_TakeResponse(&len, &status);
++
++    switch (status)
++    {
++    case PSS_STATUS_OK:
++        break;
++    case PSS_STATUS_OFFLINE:
++        PrintInfo(sText_ServerDown);
++        return;
++    default:
++        PrintInfo(sText_Refused);
++        return;
++    }
++
++    switch (sHub->pendingCmd)
++    {
++    case PSS_CMD_HELLO:
++        ShowHelloResult(data, len);
++        break;
++    case PSS_CMD_PLAYER_LIST:
++        ShowPlayerListResult(data, len);
++        break;
++    default:
++        PrintInfo(sText_BadReply);
++        break;
++    }
++}
++
++static void Task_PssHub(u8 taskId)
++{
++    s16 *data = gTasks[taskId].data;
++
++    switch (data[0])
++    {
++    case STATE_INIT:
++        PrintTitle();
++        PrintMenu();
++        PrintInfo(sText_Idle);
++        data[0]++;
++        break;
++    case STATE_FADE_IN:
++        BeginNormalPaletteFade(PALETTES_ALL, 0, 16, 0, RGB_BLACK);
++        ShowBg(1);
++        CopyBgTilemapBufferToVram(0);
++        ShowBg(0);
++        data[0]++;
++        break;
++    case STATE_WAIT_FADE_IN:
++        if (!gPaletteFade.active)
++            data[0] = STATE_INPUT;
++        break;
++    case STATE_INPUT:
++        if (PssNet_IsHostPresent() != sHub->hostWasPresent)
++        {
++            sHub->hostWasPresent = PssNet_IsHostPresent();
++            PrintTitle();
++        }
++
++        if (JOY_NEW(DPAD_UP) && sHub->cursor > 0)
++        {
++            sHub->cursor--;
++            PlaySE(SE_SELECT);
++            PrintMenu();
++        }
++        else if (JOY_NEW(DPAD_DOWN) && sHub->cursor < NUM_MENU_ITEMS - 1)
++        {
++            sHub->cursor++;
++            PlaySE(SE_SELECT);
++            PrintMenu();
++        }
++        else if (JOY_NEW(A_BUTTON))
++        {
++            PlaySE(SE_SELECT);
++            switch (sHub->cursor)
++            {
++            case MENU_CONNECT:
++                StartRequest(PSS_CMD_HELLO);
++                break;
++            case MENU_PLAYER_LIST:
++                StartRequest(PSS_CMD_PLAYER_LIST);
++                break;
++            case MENU_EXIT:
++                data[0] = STATE_FADE_OUT;
++                break;
++            }
++            if (PssNet_GetRequestState() == PSS_REQ_PENDING)
++                data[0] = STATE_WAIT_RESPONSE;
++        }
++        else if (JOY_NEW(B_BUTTON))
++        {
++            PlaySE(SE_SELECT);
++            data[0] = STATE_FADE_OUT;
++        }
++        break;
++    case STATE_WAIT_RESPONSE:
++        switch (PssNet_GetRequestState())
++        {
++        case PSS_REQ_DONE:
++            HandleResponse();
++            data[0] = STATE_INPUT;
++            break;
++        case PSS_REQ_TIMED_OUT:
++            PssNet_Cancel();
++            PrintInfo(sText_TimedOut);
++            data[0] = STATE_INPUT;
++            break;
++        default:
++            if (JOY_NEW(B_BUTTON))
++            {
++                PlaySE(SE_SELECT);
++                PssNet_Cancel();
++                PrintInfo(sText_Idle);
++                data[0] = STATE_INPUT;
++            }
++            break;
++        }
++        break;
++    case STATE_FADE_OUT:
++        PssNet_Cancel();
++        BeginNormalPaletteFade(PALETTES_ALL, 0, 0, 16, RGB_BLACK);
++        data[0] = STATE_EXIT;
++        break;
++    case STATE_EXIT:
++        if (!gPaletteFade.active)
++        {
++            ExitPssHub();
++            DestroyTask(taskId);
++        }
++        break;
++    }
++}
++
++static void CB2_RunPssHub(void)
++{
++    if (!IsDma3ManagerBusyWithBgCopy())
++    {
++        RunTasks();
++        RunTextPrinters();
++        AnimateSprites();
++        BuildOamBuffer();
++        UpdatePaletteFade();
++    }
++}
++
++static void VBlankCB_PssHub(void)
++{
++    LoadOam();
++    ProcessSpriteCopyRequests();
++    TransferPlttBuffer();
++}
++
++void CB2_ShowPssHub(void)
++{
++    SetMainCallback2(CB2_InitPssHub);
++}
++
++static void CB2_InitPssHub(void)
++{
++    SetGpuReg(REG_OFFSET_DISPCNT, 0);
++    sHub = AllocZeroed(sizeof(*sHub));
++    SetVBlankCallback(NULL);
++    ResetBgsAndClearDma3BusyFlags(FALSE);
++    InitBgsFromTemplates(0, sBgTemplates, ARRAY_COUNT(sBgTemplates));
++    SetBgTilemapBuffer(1, Alloc(BG_SCREEN_SIZE));
++    SetBgTilemapBuffer(0, Alloc(BG_SCREEN_SIZE));
++    DecompressAndLoadBgGfxUsingHeap(1, sBgTiles_Gfx, 0, 0, 0);
++    CopyToBgTilemapBuffer(1, sBgTiles_Tilemap, 0, 0);
++    InitWindows(sWindowTemplates);
++    DeactivateAllTextPrinters();
++    ResetPaletteFade();
++    ResetSpriteData();
++    ResetTasks();
++    ScanlineEffect_Stop();
++    m4aSoundVSyncOn();
++    SetVBlankCallback(VBlankCB_PssHub);
++    sHub->hostWasPresent = PssNet_IsHostPresent();
++    sHub->taskId = CreateTask(Task_PssHub, 0);
++    ChangeBgX(0, 0, BG_COORD_SET);
++    ChangeBgY(0, 0, BG_COORD_SET);
++    ChangeBgX(1, 0, BG_COORD_SET);
++    ChangeBgY(1, 0, BG_COORD_SET);
++    LoadPalette(sPalette, BG_PLTT_ID(0), PLTT_SIZE_4BPP);
++    Menu_LoadStdPalAt(BG_PLTT_ID(15));
++    FillBgTilemapBufferRect(0, 0x000, 0, 0, 32, 32, 15);
++    CopyBgTilemapBufferToVram(1);
++    SetMainCallback2(CB2_RunPssHub);
++    RunTasks();
++    RunTextPrinters();
++    AnimateSprites();
++    BuildOamBuffer();
++    UpdatePaletteFade();
++}
++
++static void ExitPssHub(void)
++{
++    s32 i;
++
++    FreeAllWindowBuffers();
++    for (i = 0; i < (int)ARRAY_COUNT(sBgTemplates); i++)
++        Free(GetBgTilemapBuffer(i));
++    Free(sHub);
++    SetMainCallback2(gMain.savedCallback);
++}
+diff --git a/src/pss_net.c b/src/pss_net.c
+new file mode 100644
+index 0000000..98be267
+--- /dev/null
++++ b/src/pss_net.c
+@@ -0,0 +1,137 @@
++#include "global.h"
++#include "pss_net.h"
++
++// Layout is part of the host protocol. Keep it 4-byte aligned and do not
++// reorder fields without bumping PSS_MAILBOX_VERSION and updating
++// bridge/PROTOCOL.md and bridge/pss_bridge.lua.
++struct PssMailbox
++{
++    /* 0x00 */ u8 magic[8];
++    /* 0x08 */ u32 version;
++    /* 0x0C */ u32 romSeq;     // ROM increments after a request is fully written
++    /* 0x10 */ u32 hostSeq;    // host writes the romSeq value it answered, after writing the response
++    /* 0x14 */ u32 hostBeat;   // host increments this regularly while it is alive
++    /* 0x18 */ u8 cmd;
++    /* 0x19 */ u8 status;      // host -> ROM, valid when hostSeq == romSeq
++    /* 0x1A */ u16 reqLen;
++    /* 0x1C */ u16 respLen;    // host -> ROM
++    /* 0x1E */ u16 pad;
++    /* 0x20 */ u8 req[PSS_PAYLOAD_MAX];
++    /* 0x60 */ u8 resp[PSS_PAYLOAD_MAX];
++    // total 0xA0
++};
++
++static EWRAM_DATA volatile struct PssMailbox sMailbox = {};
++static EWRAM_DATA u32 sLastBeat = 0;
++static EWRAM_DATA u16 sFramesSinceBeat = 0;
++static EWRAM_DATA u16 sRequestFrames = 0;
++static EWRAM_DATA u8 sRequestState = PSS_REQ_IDLE;
++static EWRAM_DATA u8 sHostPresent = FALSE;
++static EWRAM_DATA u8 sRespBuf[PSS_PAYLOAD_MAX] = {};
++
++void PssNet_Init(void)
++{
++    static const u8 magic[8] = PSS_MAILBOX_MAGIC;
++    u32 i;
++
++    // EWRAM_DATA is not loaded from the ROM, so everything is set at runtime.
++    for (i = 0; i < sizeof(sMailbox); i++)
++        ((volatile u8 *)&sMailbox)[i] = 0;
++    for (i = 0; i < 8; i++)
++        sMailbox.magic[i] = magic[i];
++    sMailbox.version = PSS_MAILBOX_VERSION;
++
++    sLastBeat = 0;
++    sFramesSinceBeat = PSS_HOST_TIMEOUT_FRAMES;
++    sRequestFrames = 0;
++    sRequestState = PSS_REQ_IDLE;
++    sHostPresent = FALSE;
++}
++
++void PssNet_Update(void)
++{
++    u32 beat = sMailbox.hostBeat;
++
++    if (beat != sLastBeat)
++    {
++        sLastBeat = beat;
++        sFramesSinceBeat = 0;
++        sHostPresent = TRUE;
++    }
++    else if (sFramesSinceBeat < PSS_HOST_TIMEOUT_FRAMES)
++    {
++        sFramesSinceBeat++;
++    }
++    else
++    {
++        sHostPresent = FALSE;
++    }
++
++    if (sRequestState == PSS_REQ_PENDING)
++    {
++        if (sMailbox.hostSeq == sMailbox.romSeq)
++        {
++            sRequestState = PSS_REQ_DONE;
++        }
++        else if (++sRequestFrames >= PSS_REQUEST_TIMEOUT_FRAMES)
++        {
++            sRequestState = PSS_REQ_TIMED_OUT;
++        }
++    }
++}
++
++bool8 PssNet_IsHostPresent(void)
++{
++    return sHostPresent;
++}
++
++bool8 PssNet_Send(u8 cmd, const void *data, u16 len)
++{
++    u32 i;
++    const u8 *src = data;
++
++    if (sRequestState == PSS_REQ_PENDING || len > PSS_PAYLOAD_MAX)
++        return FALSE;
++
++    for (i = 0; i < len; i++)
++        sMailbox.req[i] = src[i];
++    sMailbox.cmd = cmd;
++    sMailbox.reqLen = len;
++    sMailbox.status = PSS_STATUS_OK;
++    sMailbox.respLen = 0;
++
++    sRequestFrames = 0;
++    sRequestState = PSS_REQ_PENDING;
++    // Incrementing romSeq last publishes the request to the host.
++    sMailbox.romSeq++;
++    return TRUE;
++}
++
++u8 PssNet_GetRequestState(void)
++{
++    return sRequestState;
++}
++
++const u8 *PssNet_TakeResponse(u16 *len, u8 *status)
++{
++    u16 respLen = sMailbox.respLen;
++    u32 i;
++
++    if (respLen > PSS_PAYLOAD_MAX)
++        respLen = PSS_PAYLOAD_MAX;
++    for (i = 0; i < respLen; i++)
++        sRespBuf[i] = sMailbox.resp[i];
++
++    *len = respLen;
++    *status = sMailbox.status;
++    sRequestState = PSS_REQ_IDLE;
++    return sRespBuf;
++}
++
++void PssNet_Cancel(void)
++{
++    // A late response to a cancelled or timed-out request is harmless: the next
++    // PssNet_Send bumps romSeq, so hostSeq no longer matches until the host
++    // answers the new request.
++    sRequestState = PSS_REQ_IDLE;
++}
+diff --git a/src/start_menu.c b/src/start_menu.c
+index 88cc377..87ad357 100644
+--- a/src/start_menu.c
++++ b/src/start_menu.c
+@@ -13,6 +13,7 @@
+ #include "fieldmap.h"
+ #include "safari_zone.h"
+ #include "start_menu.h"
++#include "pss_hub.h"
+ #include "menu.h"
+ #include "load_save.h"
+ #include "strings.h"
+@@ -49,6 +50,7 @@ enum StartMenuOption
+     STARTMENU_EXIT,
+     STARTMENU_RETIRE,
+     STARTMENU_PLAYER2,
++    STARTMENU_PSS,
+     MAX_STARTMENU_ITEMS
+ };
+ 
+@@ -88,6 +90,7 @@ static bool8 StartMenuOptionCallback(void);
+ static bool8 StartMenuExitCallback(void);
+ static bool8 StartMenuSafariZoneRetireCallback(void);
+ static bool8 StartMenuLinkPlayerCallback(void);
++static bool8 StartMenuPssCallback(void);
+ static bool8 StartCB_Save1(void);
+ static bool8 StartCB_Save2(void);
+ static void StartMenu_PrepareForSave(void);
+@@ -122,7 +125,8 @@ static const struct MenuAction sStartMenuActionTable[] = {
+     [STARTMENU_OPTION]  = { gText_MenuOption,  {.u8_void = StartMenuOptionCallback} },
+     [STARTMENU_EXIT]    = { gText_MenuExit,    {.u8_void = StartMenuExitCallback} },
+     [STARTMENU_RETIRE]  = { gText_MenuRetire,  {.u8_void = StartMenuSafariZoneRetireCallback} },
+-    [STARTMENU_PLAYER2] = { gText_MenuPlayer,  {.u8_void = StartMenuLinkPlayerCallback} }
++    [STARTMENU_PLAYER2] = { gText_MenuPlayer,  {.u8_void = StartMenuLinkPlayerCallback} },
++    [STARTMENU_PSS]     = { gText_MenuPss,     {.u8_void = StartMenuPssCallback} }
+ };
+ 
+ static const struct WindowTemplate sSafariZoneStatsWindowTemplate = {
+@@ -144,7 +148,8 @@ static const u8 *const sStartMenuDescPointers[] = {
+     gStartMenuDesc_Option,
+     gStartMenuDesc_Exit,
+     gStartMenuDesc_Retire,
+-    gStartMenuDesc_Player
++    gStartMenuDesc_Player,
++    gStartMenuDesc_Pss
+ };
+ 
+ static const struct BgTemplate sBGTemplates_AfterLinkSaveMessage[] = {
+@@ -219,6 +224,7 @@ static void SetUpStartMenu_NormalField(void)
+     AppendToStartMenuItems(STARTMENU_BAG);
+     AppendToStartMenuItems(STARTMENU_PLAYER);
+     AppendToStartMenuItems(STARTMENU_SAVE);
++    AppendToStartMenuItems(STARTMENU_PSS);
+     AppendToStartMenuItems(STARTMENU_OPTION);
+     AppendToStartMenuItems(STARTMENU_EXIT);
+ }
+@@ -535,6 +541,20 @@ static bool8 StartMenuOptionCallback(void)
+     return FALSE;
+ }
+ 
++static bool8 StartMenuPssCallback(void)
++{
++    if (!gPaletteFade.active)
++    {
++        PlayRainStoppingSoundEffect();
++        DestroySafariZoneStatsWindow();
++        CleanupOverworldWindowsAndTilemaps();
++        SetMainCallback2(CB2_ShowPssHub);
++        gMain.savedCallback = CB2_ReturnToFieldWithOpenMenu;
++        return TRUE;
++    }
++    return FALSE;
++}
++
+ static bool8 StartMenuExitCallback(void)
+ {
+     DestroySafariZoneStatsWindow();
+diff --git a/src/strings.c b/src/strings.c
+index c099555..af319cc 100644
+--- a/src/strings.c
++++ b/src/strings.c
+@@ -162,6 +162,7 @@ const u8 gText_MenuPokenav[] = _("ポケナビ");
+ const u8 gText_MenuPlayer[] = _("{PLAYER}");
+ const u8 gText_MenuSave[] = _("SAVE");
+ const u8 gText_MenuOption[] = _("OPTION");
++const u8 gText_MenuPss[] = _("PSS");
+ const u8 gText_MenuExit[] = _("EXIT");
+ const u8 gText_MenuRetire[] = _("RETIRE");
+ const u8 gText_MenuSafariStats[] = _("{STR_VAR_1}/{STR_VAR_2}\nBALLS  {STR_VAR_3}");
+@@ -901,6 +902,7 @@ const u8 gStartMenuDesc_Pokemon[] = _("Check and organize POKéMON that are\ntra
+ const u8 gStartMenuDesc_Bag[] = _("Equipped with pockets for storing items\nyou bought, received, or found.");
+ const u8 gStartMenuDesc_Player[] = _("Check your money and other game data.");
+ const u8 gStartMenuDesc_Save[] = _("Save your game with a complete record\nof your progress to take a break.");
++const u8 gStartMenuDesc_Pss[] = _("Go online with the Player Search\nSystem.");
+ const u8 gStartMenuDesc_Option[] = _("Adjust various game settings such as text\nspeed, game rules, etc.");
+ const u8 gStartMenuDesc_Exit[] = _("Close this MENU window.");
+ const u8 gStartMenuDesc_Retire[] = _("Retire from the SAFARI GAME and return to\nthe registration counter.");

@@ -1,0 +1,103 @@
+# Builds the PSS ROM patch (pss_firered_v10.bps) on GitHub's servers.
+#
+# It builds FireRed from source twice:
+#   1. unmodified. The result is byte-for-byte the retail FireRed (USA, v1.0)
+#      and the job stops if its checksum is not the known retail value.
+#   2. with the PSS changes from pss-firered.patch applied.
+# It then saves ONLY the differences between the two as a BPS patch.
+# No ROM is uploaded anywhere: the only thing you download is the small patch.
+#
+# Run it from the repository's "Actions" tab: Build PSS patch > Run workflow.
+
+name: Build PSS patch
+
+on:
+  workflow_dispatch:
+
+env:
+  # The exact pret/pokefirered commit the PSS changes were written against.
+  POKEFIRED_COMMIT: 037335f4c725d7c9aecdac87066f2002b4bd7e14
+  # SHA-1 of the retail Pokemon FireRed (USA, v1.0) ROM.
+  RETAIL_SHA1: 41cb23d8dccc8ebd7c649cd8fbb58eeace6e2fdc
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils-arm-none-eabi git libpng-dev
+
+      - name: Build the agbcc compiler
+        run: |
+          git clone --depth 1 https://github.com/pret/agbcc agbcc
+          cd agbcc
+          ./build.sh
+
+      - name: Get the FireRed source (two copies, same commit)
+        run: |
+          for dir in base mod; do
+            git init -q "$dir"
+            git -C "$dir" remote add origin https://github.com/pret/pokefirered
+            git -C "$dir" fetch -q --depth 1 origin "$POKEFIRED_COMMIT"
+            git -C "$dir" checkout -q FETCH_HEAD
+            (cd agbcc && ./install.sh "../$dir")
+          done
+
+      - name: Build the unmodified game and check it is the retail ROM
+        working-directory: base
+        env:
+          GAME_VERSION: FIRERED
+          GAME_LANGUAGE: ENGLISH
+          GAME_REVISION: 0
+          MODERN: 0
+          COMPARE: 1
+        run: |
+          make -j"$(nproc)" all
+          actual="$(sha1sum pokefirered.gba | cut -d' ' -f1)"
+          echo "unmodified build SHA-1: $actual"
+          if [ "$actual" != "$RETAIL_SHA1" ]; then
+            echo "::error::The unmodified build is not the retail FireRed ROM, so a patch made from it would not fit players' ROMs."
+            exit 1
+          fi
+
+      - name: Apply the PSS changes
+        working-directory: mod
+        run: |
+          git apply --check "$GITHUB_WORKSPACE/pss-firered.patch"
+          git apply "$GITHUB_WORKSPACE/pss-firered.patch"
+          git status --short
+
+      - name: Build the PSS version
+        working-directory: mod
+        env:
+          GAME_VERSION: FIRERED
+          GAME_LANGUAGE: ENGLISH
+          GAME_REVISION: 0
+          MODERN: 0
+          COMPARE: 0
+        run: |
+          make -j"$(nproc)" all
+          ls -l pokefirered.gba
+
+      - name: Make the patch and prove it works
+        run: |
+          python3 tools/make_bps.py create base/pokefirered.gba mod/pokefirered.gba pss_firered_v10.bps
+          python3 tools/make_bps.py verify base/pokefirered.gba pss_firered_v10.bps mod/pokefirered.gba
+          echo "### PSS patch built" >> "$GITHUB_STEP_SUMMARY"
+          echo "Patch size: $(stat -c %s pss_firered_v10.bps) bytes" >> "$GITHUB_STEP_SUMMARY"
+          echo "Original ROM SHA-1 (retail): $RETAIL_SHA1" >> "$GITHUB_STEP_SUMMARY"
+          echo "PSS ROM SHA-1: $(sha1sum mod/pokefirered.gba | cut -d' ' -f1)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save the patch (the only file kept)
+        uses: actions/upload-artifact@v4
+        with:
+          name: pss_firered_v10
+          path: pss_firered_v10.bps
+          if-no-files-found: error
+          retention-days: 30

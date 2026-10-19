@@ -56,7 +56,7 @@ jobs:
       - name: Apply the PSS changes
         working-directory: mod
         run: |
-          git apply --check "$GITHUB_WORKSPACE/pss-firered.patch"
+          cp $GITHUB_WORKSPACE/pss-firered*.patch $GITHUB_WORKSPACE/pss-firered.patch && git apply --check $GITHUB_WORKSPACE/pss-firered.patch
           git apply "$GITHUB_WORKSPACE/pss-firered.patch"
           git status --short
 
@@ -74,7 +74,7 @@ jobs:
 
       - name: Make the patch and prove it works
         run: |
-          python3 tools/make_bps.py create base/pokefirered.gba mod/pokefirered.gba pss_firered_v10.bps
+          python3 tools/make_bps.py create base/pokefirered.gba mod/pokefirered.gba mkdir -p tools && cp make_bps*.py tools/make_bps.py && python3 tools/make_bps.py create base/pokefirered.gba mod/pokefirered.gba pss_firered_v10.bps
           python3 tools/make_bps.py verify base/pokefirered.gba pss_firered_v10.bps mod/pokefirered.gba
           echo "### PSS patch built" >> "$GITHUB_STEP_SUMMARY"
           echo "Patch size: $(stat -c %s pss_firered_v10.bps) bytes" >> "$GITHUB_STEP_SUMMARY"
